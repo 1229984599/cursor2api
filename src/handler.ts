@@ -445,13 +445,24 @@ export async function handleMessages(req: Request, res: Response): Promise<void>
 export function isTruncated(text: string): boolean {
     if (!text || text.trim().length === 0) return false;
     const trimmed = text.trimEnd();
-    // 代码块未闭合
-    const codeBlockOpen = (trimmed.match(/```/g) || []).length % 2 !== 0;
-    if (codeBlockOpen) return true;
-    // 检测 ```json action 块已开始但 JSON 对象未闭合（截断发生在工具调用参数中间）
-    const jsonActionBlocks = trimmed.match(/```json\s+action[\s\S]*?```/g) || [];
+
+    // ★ 核心检测：```json action 块是否未闭合（截断发生在工具调用参数中间）
+    // 这是最精确的截断检测 — 只关心实际的工具调用代码块
+    // 注意：不能简单计数所有 ``` 因为 JSON 字符串值里可能包含 markdown 反引号
     const jsonActionOpens = (trimmed.match(/```json\s+action/g) || []).length;
-    if (jsonActionOpens > jsonActionBlocks.length) return true;
+    if (jsonActionOpens > 0) {
+        // 从工具调用的角度检测：开始标记比闭合标记多 = 截断
+        const jsonActionBlocks = trimmed.match(/```json\s+action[\s\S]*?```/g) || [];
+        if (jsonActionOpens > jsonActionBlocks.length) return true;
+        // 所有 action 块都闭合了 = 没截断（即使响应文本被截断，工具调用是完整的）
+        return false;
+    }
+
+    // 无工具调用时的通用截断检测（纯文本响应）
+    // 代码块未闭合：只检测行首的代码块标记，避免 JSON 值中的反引号误判
+    const lineStartCodeBlocks = (trimmed.match(/^```/gm) || []).length;
+    if (lineStartCodeBlocks % 2 !== 0) return true;
+
     // XML/HTML 标签未闭合 (Cursor 有时在中途截断)
     const openTags = (trimmed.match(/^<[a-zA-Z]/gm) || []).length;
     const closeTags = (trimmed.match(/^<\/[a-zA-Z]/gm) || []).length;
@@ -721,17 +732,7 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         const originalMessages = [...activeCursorReq.messages];
         let truncationTier = 0;
 
-        // ★ 已有完整工具调用时跳过 Tier 恢复
-        // 场景：模型输出了多个工具调用，最后一个被截断
-        // isTruncated() 会因反引号不配对而返回 true，但前面的工具调用都是完整的
-        // parseToolCalls 本身能处理截断的最后一个块（tolerantParse 兜底）
-        // 进入 Tier 循环只会浪费 4 次 API 调用且每次还是会截断
-        const hasCompleteToolBlock = /```json\s+action[\s\S]+?```/.test(fullResponse);
-        if (hasCompleteToolBlock && isTruncated(fullResponse)) {
-            console.log(`[Handler] 响应截断但已有完整工具调用块，跳过 Tier 恢复（parseToolCalls 会处理截断部分）`);
-        }
-
-        while (hasTools && isTruncated(fullResponse) && !hasCompleteToolBlock && truncationTier < 4) {
+        while (hasTools && isTruncated(fullResponse) && truncationTier < 4) {
             truncationTier++;
 
             if (truncationTier <= 2) {
